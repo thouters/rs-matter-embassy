@@ -78,3 +78,5 @@ embassy-futures = "0.1"
 embassy-time = "0.5"
 static_cell = "2"
 portable-atomic = "1"
+smart-leds = "0.4"
+esp-hal-smartled = {version = "0.17.0", features = ["esp32s3"]}

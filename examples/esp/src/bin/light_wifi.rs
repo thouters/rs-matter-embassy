@@ -26,12 +26,13 @@ use esp_metadata_generated::memory_range;
 
 use log::info;
 
+use esp_hal::{rmt::Rmt, time::Rate};
+use esp_hal_smartled::{SmartLedsAdapter, buffer_size, smart_led_buffer};
 use rs_matter_embassy::epoch::epoch;
 use rs_matter_embassy::matter::dm::clusters::desc::{self, ClusterHandler as _};
-use rs_matter_embassy::matter::dm::clusters::on_off::test::TestOnOffDeviceLogic;
 use rs_matter_embassy::matter::dm::clusters::on_off::{self, OnOffHooks};
-use rs_matter_embassy::matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter_embassy::matter::dm::devices::DEV_TYPE_ON_OFF_LIGHT;
+use rs_matter_embassy::matter::dm::devices::test::{TEST_DEV_ATT, TEST_DEV_COMM, TEST_DEV_DET};
 use rs_matter_embassy::matter::dm::{Async, Dataver, EmptyHandler, Endpoint, EpClMatcher, Node};
 use rs_matter_embassy::matter::utils::init::InitMaybeUninit;
 use rs_matter_embassy::matter::{clusters, devices};
@@ -40,6 +41,10 @@ use rs_matter_embassy::stack::persist::DummyKvBlobStore;
 use rs_matter_embassy::wireless::esp::EspWifiDriver;
 use rs_matter_embassy::wireless::{EmbassyWifi, EmbassyWifiMatterStack};
 
+use smart_leds::{
+    RGB8, SmartLedsWrite, brightness, gamma,
+    hsv::{Hsv, hsv2rgb},
+};
 extern crate alloc;
 
 macro_rules! mk_static {
@@ -78,6 +83,110 @@ const RECLAIMED_RAM: usize =
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+// ***************************8
+use embassy_time::{Duration, Timer};
+
+use core::cell::{Cell, RefCell};
+use rs_matter_embassy::matter::dm::Cluster;
+use rs_matter_embassy::matter::dm::clusters::decl::on_off as on_off_cluster;
+use rs_matter_embassy::matter::dm::clusters::on_off::{
+    EffectVariantEnum, OutOfBandMessage, StartUpOnOffEnum,
+};
+use rs_matter_embassy::matter::error::Error;
+use rs_matter_embassy::matter::tlv::Nullable;
+use rs_matter_embassy::matter::with;
+
+//use crate::with;
+const LED_COUNT: usize = 1;
+
+pub struct SimpleOnOffDeviceLogic<'a, const BUFFER_SIZE: usize = { buffer_size(LED_COUNT) }> {
+    on_off: Cell<bool>,
+    start_up_on_off: Cell<Option<StartUpOnOffEnum>>,
+    led: RefCell<SmartLedsAdapter<'a, BUFFER_SIZE>>,
+}
+
+impl<'a, const BUFFER_SIZE: usize> SimpleOnOffDeviceLogic<'a, BUFFER_SIZE> {
+    pub const fn new(led: SmartLedsAdapter<'a, BUFFER_SIZE>) -> Self {
+        Self {
+            on_off: Cell::new(false),
+            start_up_on_off: Cell::new(None),
+            led: RefCell::new(led),
+        }
+    }
+}
+
+impl<'a, const BUFFER_SIZE: usize> OnOffHooks for SimpleOnOffDeviceLogic<'a, BUFFER_SIZE> {
+    const CLUSTER: Cluster<'static> = on_off_cluster::FULL_CLUSTER
+        .with_revision(6)
+        .with_attrs(with!(
+            required;
+            on_off_cluster::AttributeId::OnOff
+        ))
+        .with_cmds(with!(
+            on_off_cluster::CommandId::Off
+                | on_off_cluster::CommandId::On
+                | on_off_cluster::CommandId::Toggle
+        ));
+
+    fn on_off(&self) -> bool {
+        self.on_off.get()
+    }
+
+    fn set_on_off(&self, on: bool) {
+        self.on_off.set(on)
+    }
+
+    fn start_up_on_off(&self) -> Nullable<StartUpOnOffEnum> {
+        match self.start_up_on_off.get() {
+            Some(value) => Nullable::some(value),
+            None => Nullable::none(),
+        }
+    }
+
+    fn set_start_up_on_off(&self, value: Nullable<StartUpOnOffEnum>) -> Result<(), Error> {
+        self.start_up_on_off.set(value.into_option());
+        Ok(())
+    }
+
+    async fn handle_off_with_effect(&self, _effect: EffectVariantEnum) {
+        // no effect
+    }
+
+    async fn run<F: Fn(OutOfBandMessage)>(&self, _notify: F) {
+        // TODO: also use button push  to toggle here?
+        let mut color = Hsv {
+            hue: 0,
+            sat: 255,
+            val: 255,
+        };
+        let mut data: RGB8;
+        let level = 10;
+
+        let mut led = self.led.borrow_mut();
+
+        loop {
+            // Iterate over the rainbow!
+            for hue in 0..=255 {
+                color.hue = hue;
+                // Convert from the HSV color space (where we can easily transition from one
+                // color to the other) to the RGB color space that we can then send to the LED
+                data = hsv2rgb(color);
+                // When sending to the LED, we do a gamma correction first (see smart_leds docs
+                // for details <https://docs.rs/smart-leds/latest/smart_leds/struct.Gamma.html>)
+                // and then limit the brightness level to 10 out of 255 so that the output
+                // is not too bright.
+                if self.on_off.get() {
+                    led.write(brightness(gamma([data].into_iter()), level))
+                        .unwrap();
+                } else {
+                    led.write(brightness(gamma([data].into_iter()), 0)).unwrap();
+                }
+                Timer::after(Duration::from_millis(20)).await;
+            }
+        }
+    }
+}
+
 #[esp_rtos::main]
 async fn main(_s: Spawner) {
     esp_println::logger::init_logger(log::LevelFilter::Info);
@@ -106,6 +215,28 @@ async fn main(_s: Spawner) {
 
     let init = esp_radio::init().unwrap();
 
+    // Configure RMT (Remote Control Transceiver) peripheral globally
+    // <https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/rmt.html>
+    let rmt: Rmt<'_, esp_hal::Blocking> = {
+        let frequency: Rate = { Rate::from_mhz(80) };
+        Rmt::new(peripherals.RMT, frequency)
+    }
+    .expect("Failed to initialize RMT");
+
+    // We use one of the RMT channels to instantiate a `SmartLedsAdapter` which can
+    // be used directly with all `smart_led` implementations
+    let rmt_channel = rmt.channel0;
+    let mut rmt_buffer = smart_led_buffer!(LED_COUNT);
+
+    // Each devkit uses a unique GPIO for the RGB LED, so in order to support
+    // all chips we must unfortunately use `#[cfg]`s:
+    let led = {
+        // thouters ledstrip
+        //SmartLedsAdapter::new(rmt_channel, peripherals.GPIO11, &mut rmt_buffer)
+        // LOLIN RGB LED board
+        SmartLedsAdapter::new(rmt_channel, peripherals.GPIO16, &mut rmt_buffer)
+    };
+
     // == Step 2: ==
     // Allocate the Matter stack.
     // For MCUs, it is best to allocate it statically, so as to avoid program stack blowups (its memory footprint is ~ 35 to 50KB).
@@ -120,7 +251,7 @@ async fn main(_s: Spawner) {
     let on_off = on_off::OnOffHandler::new_standalone(
         Dataver::new_rand(stack.matter().rand()),
         LIGHT_ENDPOINT_ID,
-        TestOnOffDeviceLogic::new(true),
+        SimpleOnOffDeviceLogic::<{ buffer_size(LED_COUNT) }>::new(led),
     );
 
     // Chain our endpoint clusters
@@ -129,7 +260,7 @@ async fn main(_s: Spawner) {
         .chain(
             EpClMatcher::new(
                 Some(LIGHT_ENDPOINT_ID),
-                Some(TestOnOffDeviceLogic::CLUSTER.id),
+                Some(SimpleOnOffDeviceLogic::<{ buffer_size(LED_COUNT) }>::CLUSTER.id),
             ),
             on_off::HandlerAsyncAdaptor(&on_off),
         )
@@ -183,7 +314,10 @@ const NODE: Node = Node {
         Endpoint {
             id: LIGHT_ENDPOINT_ID,
             device_types: devices!(DEV_TYPE_ON_OFF_LIGHT),
-            clusters: clusters!(desc::DescHandler::CLUSTER, TestOnOffDeviceLogic::CLUSTER),
+            clusters: clusters!(
+                desc::DescHandler::CLUSTER,
+                SimpleOnOffDeviceLogic::<{ buffer_size(LED_COUNT) }>::CLUSTER
+            ),
         },
     ],
 };

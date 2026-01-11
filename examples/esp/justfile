@@ -1,0 +1,8 @@
+build:
+    cargo +esp build --target xtensa-esp32s3-none-elf --no-default-features --features esp32s3,wifi
+
+flash:
+    espflash flash target/xtensa-esp32s3-none-elf/debug/light_wifi --baud 1500000
+    espflash monitor --elf target/xtensa-esp32s3-none-elf/debug/light_wifi
+run:
+    espflash monitor --elf target/xtensa-esp32s3-none-elf/debug/light_wifi
